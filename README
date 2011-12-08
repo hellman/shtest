@@ -1,0 +1,11 @@
+    Shellcode testing program
+    Usage:
+        shtest {-f file | $'\xeb\xfe' | '\xb8\x39\x05\x00\x00\xc3'}
+    Usage example:
+        $ shtest $'\xeb\xfe'                 # raw shellcode
+        $ shtest '\xb8\x39\x05\x00\x00\xc3'  # escaped shellcode
+        $ shtest -f test.sc                  # shellcode from file
+        $ shtest -f <(python gen_payload.py) # test generated payload
+    Compiling:
+        gcc -Wall shtest.c -o shtest
+    Author: hellman (hellman1908@gmail.com)
