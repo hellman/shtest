@@ -40,7 +40,6 @@ void escape_error();
 int create_sock();
 void run_reader(int);
 void run_writer(int);
-//__attribute__((destructor)) void cleanup(int sig);
 void set_ready(int sig);
 
 void run_shellcode(void *sc_ptr);
@@ -240,20 +239,16 @@ void run_writer(int fd) {
         n = read(0, buf, sizeof(buf));
         if (n > 0) {
             printf("SENT %d bytes TO SOCKET\n", n);
-            write(fd, buf, sizeof(buf));
+            write(fd, buf, n);
         }
         else {
+            shutdown(fd, SHUT_WR);
+            close(fd);
             wait(&n);
             exit(0);
         }
     }
 }
-
-/*__attribute__((destructor)) void cleanup(int sig) {
-    printf("pid=%d DESTRUCTOR: SIG %d killed %d %d\n", getpid(), sig, pid1, pid2);
-    if (pid1 > 0) kill(pid1, SIGTERM);
-    if (pid2 > 0) kill(pid2, SIGTERM);
-}*/
 
 void set_ready(int sig) {
     ready = 1;
