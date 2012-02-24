@@ -6,6 +6,9 @@
         $ shtest '\xb8\x39\x05\x00\x00\xc3'  # escaped shellcode
         $ shtest -f test.sc                  # shellcode from file
         $ shtest -f <(python gen_payload.py) # test generated payload
+        $ shtest -s 5 -f test.sc             # create socket at fd=5
+            # Allows to test staged shellcodes
+            # Flow is redirected like this: STDIN -> SOCKET -> STDOUT
     Compiling:
         gcc -Wall shtest.c -o shtest
     Author: hellman (hellman1908@gmail.com)

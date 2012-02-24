@@ -20,6 +20,8 @@
         $ shtest -f test.sc                  # shellcode from file
         $ shtest -f <(python gen_payload.py) # test generated payload
         $ shtest -s 5 -f test.sc             # create socket at fd=5
+            # Allows to test staged shellcodes
+            # Flow is redirected like this: STDIN -> SOCKET -> STDOUT
     Compiling:
         gcc -Wall shtest.c -o shtest
     Author: hellman (hellman1908@gmail.com)
@@ -55,6 +57,8 @@ void usage(char * err) {
         $ shtest -f test.sc                  # shellcode from file\n\
         $ shtest -f <(python gen_payload.py) # test generated payload\n\
         $ shtest -s 5 -f test.sc             # create socket at fd=5 (STDIN <- SOCKET -> STDOUT)\n\
+            # Allows to test staged shellcodes\
+            # Flow is redirected like this: STDIN -> SOCKET -> STDOUT\
     Compiling:\n\
         gcc -Wall shtest.c -o shtest\n\
     Author: hellman (hellman1908@gmail.com)\n");
