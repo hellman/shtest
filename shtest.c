@@ -1,27 +1,52 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/types.h> /* See NOTES */
+#include <sys/wait.h>
+#include <sys/socket.h>
 
 /*------------------------------------------
     Shellcode testing program
     Usage:
-        shtest {-f file | $'\xeb\xfe' | '\xb8\x39\x05\x00\x00\xc3'}
+        shtest [-s socked_fd_no] {-f file | $'\xeb\xfe' | '\xb8\x39\x05\x00\x00\xc3'}
     Usage example:
         $ shtest $'\xeb\xfe'                 # raw shellcode
         $ shtest '\xb8\x39\x05\x00\x00\xc3'  # escaped shellcode
         $ shtest -f test.sc                  # shellcode from file
         $ shtest -f <(python gen_payload.py) # test generated payload
+        $ shtest -s 5 -f test.sc             # create socket at fd=5
     Compiling:
         gcc -Wall shtest.c -o shtest
     Author: hellman (hellman1908@gmail.com)
 -------------------------------------------*/
 
 char buf[4096];
+int pid1, pid2;
+int sock;
+int ready;
 
-void usage() {
+void usage(char * err);
+int main(int argc, char **argv);
+
+void load_from_file(char *fname);
+void copy_from_argument(char *arg);
+void escape_error();
+
+int create_sock();
+__attribute__((destructor)) void cleanup(int sig);
+void set_ready(int sig);
+void run_reader(int);
+void run_writer(int);
+
+void run_shellcode(void *sc_ptr);
+
+
+void usage(char * err) {
     printf("    Shellcode testing program\n\
     Usage:\n\
         shtest {-f file | $'\\xeb\\xfe' | '\\xb8\\x39\\x05\\x00\\x00\\xc3'}\n\
@@ -30,10 +55,107 @@ void usage() {
         $ shtest '\\xb8\\x39\\x05\\x00\\x00\\xc3'  # escaped shellcode\n\
         $ shtest -f test.sc                  # shellcode from file\n\
         $ shtest -f <(python gen_payload.py) # test generated payload\n\
+        $ shtest -s 5 -f test.sc             # create socket at fd=5 (STDIN <- SOCKET -> STDOUT)\n\
     Compiling:\n\
         gcc -Wall shtest.c -o shtest\n\
     Author: hellman (hellman1908@gmail.com)\n");
+    if (err) printf("\nerr: %s\n", err);
     exit(1);
+}
+
+int main(int argc, char **argv) {
+    char * fname = NULL;
+    int c;
+
+    pid1 = pid2 = -1;
+    sock = -1;
+
+    while ((c = getopt(argc, argv, "hus:f:")) != -1) {
+        switch (c) {
+            case 'f':
+                fname = optarg;
+                break;
+            case 's':
+                sock = atoi(optarg);
+                if (sock <= 2 || sock > 1024)
+                    usage("bad descriptor number for sock");
+                break;
+            case 'h':
+            case 'u':
+                usage(NULL);
+            default:
+                usage("unknown argument");
+        }
+    }
+
+    if (argc == 1)
+        usage(NULL);
+
+    if (optind < argc && fname)
+        usage("can't load shellcode both from argument and file");
+    
+    if (!(optind < argc) && !fname)
+        usage("please provide shellcode via either argument or file");
+
+    if (optind < argc) {
+        copy_from_argument(argv[optind]);
+    }
+    else {
+        load_from_file(fname);
+    }
+
+    //create socket if needed
+    if (sock != -1) {
+        int created_sock = create_sock(sock);
+        if (sock != created_sock)
+            exit(103);
+
+        printf("Created socket %d\n", created_sock);
+
+        signal(SIGINT, cleanup);
+        signal(SIGFPE, cleanup);
+        signal(SIGSEGV, cleanup);
+        signal(SIGILL, cleanup);
+        signal(SIGTERM, cleanup);
+    }
+
+    run_shellcode(buf);
+    return 100;
+}
+
+void load_from_file(char *fname) {
+    FILE * fd = fopen(fname, "r");
+    if (!fd) {
+        perror("fopen");
+        exit(100);
+    }
+
+    int c = fread(buf, 1, 4096, fd);
+    printf("Read %d bytes from '%s'\n", c, fname);
+    fclose(fd);
+}
+
+void copy_from_argument(char *arg) {
+    //try to translate from escapes ( \xc3 )
+
+    bzero(buf, sizeof(buf));
+    strncpy(buf, arg, sizeof(buf));
+
+    int i;
+    char *p1 = buf;
+    char *p2 = buf;
+    char *end = p1 + strlen(p1);
+
+    while (p1 < end) {
+        i = sscanf(p1, "\\x%02x", (unsigned int *)p2);
+        if (i != 1) {
+            if (p2 == p1) break;
+            else escape_error();
+        }
+
+        p1 += 4;
+        p2 += 1;
+    }
 }
 
 void escape_error() {
@@ -41,8 +163,100 @@ void escape_error() {
     exit(1);
 }
 
+int create_sock() {
+    int fds[2];
+    int sock2;
+        
+    int result = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    if (result == -1) {
+        perror("socket");
+        exit(101);
+    }
+
+    if (sock == fds[0]) {
+        sock2 = fds[1];
+    }
+    else if (sock == fds[1]) {
+        sock2 = fds[0];
+    }
+    else {
+        dup2(fds[0], sock);
+        close(fds[0]);
+        sock2 = fds[1];
+    }
+
+    ready = 0;
+    signal(SIGUSR1, set_ready);
+
+    pid1 = fork();
+    if (pid1 == 0) {
+        close(sock);
+        run_reader(sock2);
+    }
+
+    pid2 = fork();
+    if (pid2 == 0) {
+        close(sock);
+        run_writer(sock2);
+    }
+
+    close(sock2);
+    return sock;
+}
+
+void run_reader(int fd) {
+    char buf[4096];
+    int n;
+
+    while (!ready) {
+        usleep(0.1);
+    }
+
+    while (1) {
+        n = read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            printf("RECV %d bytes FROM SOCKET: ", n);
+            fflush(stdout);
+            write(1, buf, n);
+        }
+        else {
+            //wait(&n);
+            exit(0);
+        }
+    }
+}
+
+void run_writer(int fd) {
+    char buf[4096];
+    int n;
+    
+    while (!ready) {
+        usleep(0.1);
+    }
+
+    while (1) {
+        n = read(0, buf, sizeof(buf));
+        if (n > 0) {
+            printf("SENT %d bytes TO SOCKET\n", n);
+            write(fd, buf, sizeof(buf));
+        }
+        else {
+            wait(&n);
+        }
+    }
+}
+
+__attribute__((destructor)) void cleanup(int sig) {
+    //if (pid1 != -1) kill(pid1, SIGTERM); // exits by self
+    if (pid2 != -1) kill(pid2, SIGTERM);
+}
+
+void set_ready(int sig) {
+    ready = 1;
+}
+
 void run_shellcode(void *sc_ptr) {
-    int ret = 0;
+    int ret = 0, status = 0;
     int (*ptr)();
     
     ptr = sc_ptr;
@@ -65,76 +279,18 @@ void run_shellcode(void *sc_ptr) {
     printf("  esi: %p, edi: %p\n", esi, edi);
 
     printf("----------------------\n");
+    if (pid1 != -1) kill(pid1, SIGUSR1);
+    if (pid2 != -1) kill(pid2, SIGUSR1);
+
     ret = (*ptr)();
+
+    if (sock != -1)
+        close(sock);
+    
+    wait(&status);
+
     printf("----------------------\n");
     
     printf("Shellcode returned %d\n", ret);
     exit(0);
-}
-
-int main(int argc, char **argv) {
-    
-    if (argc < 2 || argc > 3)
-        usage();
-    
-    /*if (argc == 2 && (strlen(argv[1]) != 2 || argv[1][0] != '-'))
-        run_shellcode(argv[1]);*/
-    
-    char * fname = NULL;
-    
-    int c;
-    while ((c = getopt (argc, argv, "hus:f:")) != -1) {
-        switch (c) {
-            case 'f':
-                fname = optarg;
-                break;
-            case 'h':
-            case 'u':
-            default:
-                usage();
-        }
-    }
-    
-    //shellcode via argv
-    if (optind < argc) {
-        if (fname)
-            usage();
-
-        //try to translate from escapes ( \xc3 )
-        int i;
-        char *p1 = argv[optind];
-        char *p2 = argv[optind];
-        char *end = p1 + strlen(p1);
-
-        while (p1 < end) {
-            i = sscanf(p1, "\\x%02x", (unsigned int *)p2);
-            if (i != 1) {
-                if (p2 == p1) break;
-                else escape_error();
-            }
-
-            p1 += 4;
-            p2 += 1;
-        }
-
-        run_shellcode(argv[optind]);
-        return 0;
-    }
-    
-    if (!fname)
-        usage();
-
-    FILE * fd = fopen(fname, "r");
-    if (!fd) {
-        perror("fopen");
-        return 100;
-    }
-
-    c = fread(buf, 1, 4096, fd);
-    printf("Read %d bytes from '%s'\n", c, fname);
-    fclose(fd);
-
-    run_shellcode(buf);
-    
-    return 100;
 }
