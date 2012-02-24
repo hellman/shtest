@@ -38,10 +38,10 @@ void copy_from_argument(char *arg);
 void escape_error();
 
 int create_sock();
-__attribute__((destructor)) void cleanup(int sig);
-void set_ready(int sig);
 void run_reader(int);
 void run_writer(int);
+//__attribute__((destructor)) void cleanup(int sig);
+void set_ready(int sig);
 
 void run_shellcode(void *sc_ptr);
 
@@ -107,16 +107,7 @@ int main(int argc, char **argv) {
     //create socket if needed
     if (sock != -1) {
         int created_sock = create_sock(sock);
-        if (sock != created_sock)
-            exit(103);
-
         printf("Created socket %d\n", created_sock);
-
-        signal(SIGINT, cleanup);
-        signal(SIGFPE, cleanup);
-        signal(SIGSEGV, cleanup);
-        signal(SIGILL, cleanup);
-        signal(SIGTERM, cleanup);
     }
 
     run_shellcode(buf);
@@ -188,6 +179,16 @@ int create_sock() {
     ready = 0;
     signal(SIGUSR1, set_ready);
 
+    /*
+    writer: stdin -> socket (when SC exits/fails, receives SIGCHLD and exits)
+    \--> main: shellcode (when exits/fails, sends SIGCHLD to writer and closes socket)
+         \--> reader: sock -> stdout (when SC exits/fails, socket is closed and reader exits)
+
+    main saves pid1 = reader,
+               pid2 = writer
+    to send them SIGUSR1 right before running shellcode
+    */
+
     pid1 = fork();
     if (pid1 == 0) {
         close(sock);
@@ -195,10 +196,12 @@ int create_sock() {
     }
 
     pid2 = fork();
-    if (pid2 == 0) {
+    if (pid2 > 0) { // parent - writer
+        signal(SIGCHLD, exit);
         close(sock);
         run_writer(sock2);
     }
+    pid2 = getppid();
 
     close(sock2);
     return sock;
@@ -220,7 +223,6 @@ void run_reader(int fd) {
             write(1, buf, n);
         }
         else {
-            //wait(&n);
             exit(0);
         }
     }
@@ -242,14 +244,16 @@ void run_writer(int fd) {
         }
         else {
             wait(&n);
+            exit(0);
         }
     }
 }
 
-__attribute__((destructor)) void cleanup(int sig) {
-    //if (pid1 != -1) kill(pid1, SIGTERM); // exits by self
-    if (pid2 != -1) kill(pid2, SIGTERM);
-}
+/*__attribute__((destructor)) void cleanup(int sig) {
+    printf("pid=%d DESTRUCTOR: SIG %d killed %d %d\n", getpid(), sig, pid1, pid2);
+    if (pid1 > 0) kill(pid1, SIGTERM);
+    if (pid2 > 0) kill(pid2, SIGTERM);
+}*/
 
 void set_ready(int sig) {
     ready = 1;
@@ -279,8 +283,8 @@ void run_shellcode(void *sc_ptr) {
     printf("  esi: %p, edi: %p\n", esi, edi);
 
     printf("----------------------\n");
-    if (pid1 != -1) kill(pid1, SIGUSR1);
-    if (pid2 != -1) kill(pid2, SIGUSR1);
+    if (pid1 > 0) kill(pid1, SIGUSR1);
+    if (pid2 > 0) kill(pid2, SIGUSR1);
 
     ret = (*ptr)();
 
